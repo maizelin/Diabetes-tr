@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>糖尿病用藥決策支援系統 - SMART on FHIR</title>
+    <script src="https://cdn.jsdelivr.net/npm/fhirclient/build/fhir-client.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body { font-family: Arial, sans-serif; background-color: #f4f6f9; padding: 20px; margin: 0; }
+        .card { background: white; border-radius: 10px; padding: 20px; margin-bottom: 20px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
+        h1, h2 { color: #0056b3; }
+        #patient-selector { margin-bottom: 20px; }
+        select { padding: 8px; font-size: 16px; }
+        canvas { max-width: 100%; height: 300px !important; }
+        .indicator-bar { height: 30px; border-radius: 6px; margin: 10px 0; position: relative; overflow: hidden; }
+        .bar-label { position: absolute; width: 100%; text-align: center; line-height: 30px; color: white; font-weight: bold; text-shadow: 1px 1px 2px black; }
+        .green { background: #28a745; }
+        .yellow { background: #ffc107; }
+        .red { background: #dc3545; }
+        .highlight { background-color: #ffebcc; padding: 10px; border-left: 5px solid #ff9800; margin: 10px 0; }
+        #loading { text-align: center; font-size: 18px; margin: 50px; }
+    </style>
+</head>
+<body>
+    <h1>糖尿病用藥決策支援系統</h1>
+
+    <!-- 展示用手動切換（正式上線可隱藏） -->
+    <div id="patient-selector">
+        <label>選擇測試個案：</label>
+        <select id="testPatient">
+            <option value="683785">1. 陳志明（年輕新診斷，快速改善）</option>
+            <option value="683813">2. 王小明（合併中度腎病變）</option>
+            <option value="683847">3. 林阿花（高齡多共病，目標放寬）</option>
+            <option value="683882">4. 張家豪（年輕肥胖，反彈後改善）</option>
+            <option value="684487">5. 李怡君（控制良好，可減藥）</option>
+        </select>
+    </div>
+
+    <div id="loading">讀取病患資料中...</div>
+
+    <div id="content" style="display:none;">
+        <div class="card">
+            <h2>病患資訊</h2>
+            <p id="patient-info"></p>
+        </div>
+
+        <div class="card">
+            <h2>兩年 HbA1c 趨勢</h2>
+            <canvas id="hba1cChart"></canvas>
+        </div>
+
+        <div class="card">
+            <h2>臨床指標（最新值）</h2>
+            <div id="indicators"></div>
+        </div>
+
+        <div class="card">
+            <h2>ADA 2025 個人化用藥建議</h2>
+            <div id="recommendations"></div>
+        </div>
+    </div>
+
+    <script>
+        // 測試個案清單（正式環境可移除）
+        const testPatients = {
+            "683785": { name: "陳志明", age: 45, target: 7.0 },
+            "683813": { name: "王小明", age: 62, target: 7.5, ckd: true },
+            "683847": { name: "林阿花", age: 65, target: 8.0, elderly: true },
+            "683882": { name: "張家豪", age: 40, target: 7.0, obese: true },
+            "684487": { name: "李怡君", age: 52, target: 7.0, wellControlled: true }
+        };
+
+        let chart = null;
+
+        async function loadPatient(patientId) {
+            document.getElementById("loading").style.display = "block";
+            document.getElementById("content").style.display = "none";
+
+            // 模擬從 FHIR 取得的資料（在真實環境會用 client.request）
+            // 這裡直接用我們已知的測試資料
+            const patientInfo = testPatients[patientId];
+            const name = patientInfo.name;
+
+            // 模擬取得所有 HbA1c（25筆）
+            const hba1cData = await fetchHbA1c(patientId);
+            const latestHba1c = hba1cData[0].value;
+            const previousHba1c = hba1cData.length > 12 ? hba1cData[12].value : latestHba1c;
+
+            // 模擬取得 eGFR 與 BMI
+            const { egfr, bmi } = await fetchOtherObservations(patientId);
+
+            document.getElementById("patient-info").innerHTML = `
+                <strong>姓名：</strong>${name}　|　年齡：${patientInfo.age}歲　|　Patient ID: ${patientId}
+            `;
+
+            // 畫趨勢圖
+            drawChart(hba1cData);
+
+            // 指標色塊
+            document.getElementById("indicators").innerHTML = `
+                <p><strong>HbA1c 目前 ${latestHba1c}%（個人化目標 ≤${patientInfo.target}%）</strong></p>
+                <div class="indicator-bar ${getHba1cColor(latestHba1c, patientInfo.target)}">
+                    <div class="bar-label">HbA1c ${latestHba1c}%</div>
+                </div>
+
+                <p><strong>eGFR ${egfr || '未知'} mL/min/1.73m²</strong></p>
+                <div class="indicator-bar ${getEgfrColor(egfr)}">
+                    <div class="bar-label">eGFR ${egfr || '—'}</div>
+                </div>
+
+                <p><strong>BMI ${bmi || '未知'} kg/m²</strong></p>
+                <div class="indicator-bar ${getBmiColor(bmi)}">
+                    <div class="bar-label">BMI ${bmi || '—'}</div>
+                </div>
+            `;
+
+            // 用藥建議
+            let recs = [];
+            const trend = previousHba1c - latestHba1c; // 正值表示改善
+
+            recs.push(`<div class="highlight">最新 HbA1c：${latestHba1c}%（目標 ≤${patientInfo.target}%）</div>`);
+
+            if (patientInfo.wellControlled && latestHba1c <= 6.5) {
+                recs.push(`<div class="highlight">✅ 控制極佳（HbA1c ${latestHba1c}%），可考慮減藥或去階梯化（de-prescribing）</div>`);
+            } else if (latestHba1c > patientInfo.target + 0.5) {
+                recs.push(`<div class="highlight">⚠ HbA1c 高於個人化目標，建議加強治療</div>`);
+            } else {
+                recs.push(`<div class="highlight">✓ HbA1c 在目標範圍內，維持現況監測</div>`);
+            }
+
+            if (patientInfo.ckd) {
+                recs.push(`<div class="highlight">🛡 合併 CKD：強烈建議使用 SGLT2i（腎保護效益）</div>`);
+            }
+            if (patientInfo.obese) {
+                recs.push(`<div class="highlight">⚖ 肥胖為主要問題：優先考慮 GLP-1 RA（兼具減重效果）</div>`);
+            }
+            if (patientInfo.elderly) {
+                recs.push(`<div class="highlight">👵 高齡多共病：避免易低血糖藥物（如 Sulfonylurea），目標放寬至 ≤8.0%</div>`);
+            }
+
+            if (trend > 0.5) {
+                recs.push(`<div class="highlight">📈 過去一年 HbA1c 下降 ${trend.toFixed(1)}%，控制明顯改善，持續追蹤</div>`);
+            }
+
+            document.getElementById("recommendations").innerHTML = recs.join("");
+
+            document.getElementById("loading").style.display = "none";
+            document.getElementById("content").style.display = "block";
+        }
+
+        // 模擬資料取得函數（實際上線時換成 client.request）
+        async function fetchHbA1c(patientId) {
+            // 這裡用固定資料模擬 25 筆（實際會用 FHIR query）
+            const mockData = {
+                "683785": generateSeries(9.5, 7.1),   // 快速下降
+                "683813": generateSeries(8.5, 7.6),   // 緩慢下降
+                "683847": generateSeries(7.8, 7.5, 0.2), // 穩定小波動
+                "683882": generateSeries(8.5, 6.1),   // 明顯改善
+                "684487": generateSeries(6.5, 5.8)    // 持續良好
+            };
+            return mockData[patientId].map((v, i) => ({
+                date: new Date(2023, i, 1).toLocaleDateString('zh-TW', { year: 'numeric', month: 'short' }),
+                value: v
+            }));
+        }
+
+        async function fetchOtherObservations(patientId) {
+            const data = {
+                "683785": { egfr: 90, bmi: 27 },
+                "683813": { egfr: 45, bmi: 26 },
+                "683847": { egfr: 55, bmi: 22 },
+                "683882": { egfr: 95, bmi: 33 },
+                "684487": { egfr: 100, bmi: 21 }
+            };
+            return data[patientId] || { egfr: null, bmi: null };
+        }
+
+        function generateSeries(start, end, volatility = 0.4) {
+            let values = [start];
+            let current = start;
+            for (let i = 1; i < 25; i++) {
+                const step = (end - start) / 24;
+                current += step + (Math.random() - 0.5) * volatility;
+                values.push(Math.round(current * 10) / 10);
+            }
+            return values;
+        }
+
+        function getHba1cColor(value, target) {
+            if (value <= target) return "green";
+            if (value <= target + 0.5) return "yellow";
+            return "red";
+        }
+
+        function getEgfrColor(egfr) {
+            if (!egfr) return "yellow";
+            if (egfr >= 90) return "green";
+            if (egfr >= 60) return "yellow";
+            return "red";
+        }
+
+        function getBmiColor(bmi) {
+            if (!bmi) return "yellow";
+            if (bmi < 18.5 || bmi >= 30) return "red";
+            if (bmi >= 24) return "yellow";
+            return "green";
+        }
+
+        function drawChart(data) {
+            const ctx = document.getElementById('hba1cChart').getContext('2d');
+            if (chart) chart.destroy();
+
+            chart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: data.map(d => d.date),
+                    datasets: [{
+                        label: 'HbA1c (%)',
+                        data: data.map(d => d.value),
+                        borderColor: '#0056b3',
+                        backgroundColor: 'rgba(0, 86, 179, 0.1)',
+                        tension: 0.3,
+                        fill: true
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    scales: {
+                        y: { suggestedMin: 5, suggestedMax: 10 }
+                    }
+                }
+            });
+        }
+
+        // 主程式
+        FHIR.oauth2.ready()
+            .then(client => {
+                loadPatient(client.patient.id); // 真實環境使用
+            })
+            .catch(() => {
+                // 如果沒有 SMART launch（直接開啟），預設第一位病人
+                loadPatient("683785");
+            });
+
+        // 手動切換測試個案
+        document.getElementById("testPatient").addEventListener("change", (e) => {
+            loadPatient(e.target.value);
+        });
+    </script>
+</body>
+</html>
